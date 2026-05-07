@@ -1,23 +1,17 @@
 # =============================================================================
 # unzip-from-comment.yml
 #
-# Triggered by an issue or PR comment starting with "unzip".
-#
-# Fixes in this version:
-#   - Removed invalid trim() call from job-level if condition.
-#   - Moved comment body parsing entirely into a bash step (safer, no injection).
-#   - Uses a file-based approach for comment body to avoid YAML quoting issues.
-#   - RUN_LABEL is now passed as a single argument to the shell script.
+# Two trigger modes:
+#   1. issue_comment  — comment "unzip <url1> [url2] ..." on any issue/PR
+#   2. workflow_dispatch — run manually from the Actions tab with a URLs input
 #
 # Comment format:
 #   unzip https://example.com/archive.zip
 #   unzip https://example.com/movie.part1.rar https://example.com/movie.part2.rar
 #
-# Branch protection note:
-#   Results are pushed to unzip-results/* branches using GITHUB_TOKEN.
-#   If branch protection rules block bot pushes, store a PAT as
-#   ACTIONS_PAT secret and replace secrets.GITHUB_TOKEN with
-#   secrets.ACTIONS_PAT in the checkout and push steps.
+# Manual dispatch:
+#   Go to Actions → "Unzip from Comment" → Run workflow
+#   Fill in the "urls" field with space-separated URLs.
 # =============================================================================
 
 name: Unzip from Comment
@@ -26,14 +20,21 @@ on:
   issue_comment:
     types: [created]
 
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated archive URLs to download and extract'
+        required: true
+        type: string
+
 jobs:
   unzip:
-    # Run only when comment body starts with 'unzip' (any casing).
-    # We avoid trim() which is not a valid GitHub Actions expression function.
+    # For issue_comment: only run when body starts with 'unzip'.
+    # For workflow_dispatch: always run (no comment filter needed).
     if: >
+      github.event_name == 'workflow_dispatch' ||
       startsWith(github.event.comment.body, 'unzip') ||
       startsWith(github.event.comment.body, 'Unzip') ||
-      startsWith(github.event.comment.body, 'UNZIP') ||
       startsWith(github.event.comment.body, 'UNZIP') ||
       startsWith(github.event.comment.body, ' unzip') ||
       startsWith(github.event.comment.body, ' Unzip') ||
@@ -45,8 +46,9 @@ jobs:
       pull-requests: write
 
     steps:
-      # ── 1. React immediately so the user knows the workflow started ────────
+      # ── 1. React to comment (only for issue_comment trigger) ───────────────
       - name: React to comment
+        if: github.event_name == 'issue_comment'
         uses: actions/github-script@v7
         with:
           script: |
@@ -57,14 +59,14 @@ jobs:
               content:    'rocket'
             });
 
-      # ── 2. Checkout full history so we can create a new branch ────────────
+      # ── 2. Checkout repository ───────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # ── 3. Install all required tools ─────────────────────────────────────
+      # ── 3. Install dependencies ──────────────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -y
@@ -77,62 +79,67 @@ jobs:
             curl \
             wget
 
-      # ── 4. Write comment body to a temp file and parse URLs ───────────────
-      # We write to a file first to avoid any shell quoting / injection issues
-      # when the comment contains special characters, backticks, or quotes.
-      - name: Parse URLs from comment
+      # ── 4. Parse URLs (from comment body or dispatch input) ───────────────
+      - name: Parse URLs
         id: parse
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
+          DISPATCH_URLS: ${{ inputs.urls }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -Eeuo pipefail
 
-          # Write comment body to a temp file
-          printf '%s' "$COMMENT_BODY" > /tmp/comment_body.txt
-
-          # Strip leading 'unzip' keyword (case-insensitive) and normalise whitespace
-          URLS_RAW=$(sed -E 's/^[[:space:]]*[Uu][Nn][Zz][Ii][Pp][[:space:]]*//' /tmp/comment_body.txt \
-            | tr -s '[:space:]' ' ' \
-            | xargs)
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            # Manual run: use the urls input directly
+            URLS_RAW=$(printf '%s' "$DISPATCH_URLS" | tr -s '[:space:]' ' ' | xargs)
+          else
+            # Comment trigger: strip the 'unzip' keyword from comment body
+            printf '%s' "$COMMENT_BODY" > /tmp/comment_body.txt
+            URLS_RAW=$(sed -E 's/^[[:space:]]*[Uu][Nn][Zz][Ii][Pp][[:space:]]*//' /tmp/comment_body.txt \
+              | tr -s '[:space:]' ' ' \
+              | xargs)
+          fi
 
           if [[ -z "$URLS_RAW" ]]; then
-            echo "[ERROR] No URLs found in comment. Aborting."
+            echo "[ERROR] No URLs found. Aborting."
             exit 1
           fi
 
           echo "Parsed URLs: $URLS_RAW"
           echo "urls=$URLS_RAW" >> "$GITHUB_OUTPUT"
 
-      # ── 5. Create a dedicated result branch ───────────────────────────────
+      # ── 5. Create result branch ────────────────────────────────────────────────
       - name: Create result branch
         id: branch
         run: |
           set -Eeuo pipefail
-          ISSUE_NUM="${{ github.event.issue.number }}"
           RUN_ID="${{ github.run_id }}"
-          BRANCH_NAME="unzip-results/issue${ISSUE_NUM}-run${RUN_ID}"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            LABEL="manual-run${RUN_ID}"
+          else
+            ISSUE_NUM="${{ github.event.issue.number }}"
+            LABEL="issue${ISSUE_NUM}-run${RUN_ID}"
+          fi
+
+          BRANCH_NAME="unzip-results/${LABEL}"
           git checkout -b "$BRANCH_NAME"
           echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
-          echo "run_label=issue${ISSUE_NUM}-run${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "run_label=$LABEL" >> "$GITHUB_OUTPUT"
 
       # ── 6. Make helper script executable ──────────────────────────────────
       - name: Prepare script
         run: chmod +x scripts/unzip_from_comment.sh
 
-      # ── 7. Download, validate, extract, and split ─────────────────────────
+      # ── 7. Download, extract, and split ──────────────────────────────────────
       - name: Download, extract, and split
         run: |
           set -Eeuo pipefail
           RUN_LABEL="${{ steps.branch.outputs.run_label }}"
-
-          # Convert space-separated URL string to an array safely
           IFS=' ' read -ra URL_ARRAY <<< "${{ steps.parse.outputs.urls }}"
+          bash scripts/unzip_from_comment.sh "$RUN_LABEL" "${URL_ARRAY[@]}"
 
-          bash scripts/unzip_from_comment.sh \
-            "$RUN_LABEL" \
-            "${URL_ARRAY[@]}"
-
-      # ── 8. Commit and push to the result branch ───────────────────────────
+      # ── 8. Commit and push ───────────────────────────────────────────────────────
       - name: Commit and push to result branch
         id: commit
         run: |
@@ -141,7 +148,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           RUN_LABEL="${{ steps.branch.outputs.run_label }}"
-
           git add "folder/${RUN_LABEL}/" "extracted/${RUN_LABEL}/" 2>/dev/null || true
 
           if git diff --cached --quiet; then
@@ -153,7 +159,7 @@ jobs:
             echo "committed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── 9. Build a file summary for the success comment ───────────────────
+      # ── 9. Build summary ───────────────────────────────────────────────────────────
       - name: Build file summary
         id: summary
         if: steps.commit.outputs.committed == 'true'
@@ -164,7 +170,6 @@ jobs:
           DL_COUNT=$(find "folder/${RUN_LABEL}" -type f 2>/dev/null | wc -l | xargs)
           EX_COUNT=$(find "extracted/${RUN_LABEL}" -type f 2>/dev/null | wc -l | xargs)
           SPLIT_COUNT=$(find "extracted/${RUN_LABEL}" -type f -name '*.part_*' 2>/dev/null | wc -l | xargs)
-
           FILE_LIST=$(find "extracted/${RUN_LABEL}" -type f 2>/dev/null | sort | head -20 \
             | sed "s|extracted/${RUN_LABEL}/||" \
             | awk '{print "- `" $0 "`"}')
@@ -182,9 +187,9 @@ jobs:
             echo 'EOFSUM'
           } >> "$GITHUB_OUTPUT"
 
-      # ── 10. Post success comment ───────────────────────────────────────────
+      # ── 10. Post success comment (issue_comment trigger only) ──────────────
       - name: Post success comment
-        if: success()
+        if: success() && github.event_name == 'issue_comment'
         uses: actions/github-script@v7
         env:
           SUMMARY: ${{ steps.summary.outputs.summary }}
@@ -196,11 +201,9 @@ jobs:
             const repoUrl   = `${{ github.server_url }}/${{ github.repository }}`;
             const branchUrl = `${repoUrl}/tree/${branch}`;
             const runUrl    = `${repoUrl}/actions/runs/${{ github.run_id }}`;
-
             const body = committed === 'true'
               ? `\u2705 **Unzip complete!**\n\nResults committed to branch [\`${branch}\`](${branchUrl}).\n\n${summary}\n\n[View Actions log](${runUrl})`
               : `\u2705 **Unzip ran but nothing new was committed.**\n\n[View Actions log](${runUrl})`;
-
             await github.rest.issues.createComment({
               owner:        context.repo.owner,
               repo:         context.repo.repo,
@@ -208,9 +211,20 @@ jobs:
               body
             });
 
-      # ── 11. Post failure comment ──────────────────────────────────────────
+      # ── 11. Print summary to Actions log (dispatch trigger) ───────────────
+      - name: Print dispatch summary
+        if: success() && github.event_name == 'workflow_dispatch'
+        run: |
+          echo "===================================="
+          echo " Unzip complete (manual dispatch)"
+          echo "===================================="
+          echo "Branch : ${{ steps.branch.outputs.branch_name }}"
+          echo "Label  : ${{ steps.branch.outputs.run_label }}"
+          echo "Committed: ${{ steps.commit.outputs.committed }}"
+
+      # ── 12. Post failure comment (issue_comment trigger only) ────────────
       - name: Post failure comment
-        if: failure()
+        if: failure() && github.event_name == 'issue_comment'
         uses: actions/github-script@v7
         with:
           script: |
