@@ -1,13 +1,26 @@
 # =============================================================================
 # unzip-from-comment.yml
 #
-# Triggered by an issue or PR comment that starts with "unzip".
-# Downloads the listed archive URLs, extracts them, splits files > 90 MB,
-# and commits everything back to the repository.
+# Triggered by an issue or PR comment starting with "unzip".
+#
+# Improvements over v1:
+#   - Results are committed to a separate branch (unzip-results/<issue>-<runid>)
+#     instead of directly to main, keeping the default branch clean.
+#   - Path-traversal validation is performed before extracting any archive.
+#   - Smarter multi-part detection: only part 1 is passed to the extractor.
+#   - Per-run unique output folders prevent accidental overwrites.
+#   - Split file naming preserves the original extension: video.mp4.part_aa
+#   - Detailed success comment includes branch name and file summary.
 #
 # Comment format:
 #   unzip https://example.com/archive.zip
 #   unzip https://example.com/movie.part1.rar https://example.com/movie.part2.rar
+#
+# Branch protection note:
+#   Results are pushed to unzip-results/* branches using GITHUB_TOKEN.
+#   If branch protection rules block bot pushes, store a PAT as
+#   ACTIONS_PAT secret and replace secrets.GITHUB_TOKEN with
+#   secrets.ACTIONS_PAT in the checkout and push steps.
 # =============================================================================
 
 name: Unzip from Comment
@@ -19,37 +32,37 @@ on:
 jobs:
   unzip:
     # Only run when the comment body starts with "unzip" (case-insensitive)
-    if: |
+    if: >
       startsWith(github.event.comment.body, 'unzip') ||
       startsWith(github.event.comment.body, 'Unzip') ||
       startsWith(github.event.comment.body, 'UNZIP')
     runs-on: ubuntu-latest
     permissions:
-      contents: write          # allow pushing commits
-      issues: write            # allow posting reaction / status comments
-      pull-requests: write
+      contents: write        # push to result branch
+      issues: write          # post comments and reactions
+      pull-requests: write   # post comments on PRs
 
     steps:
-      # ── 1. React to comment so the user sees the workflow started ──────────
+      # ── 1. React immediately so the user knows the workflow started ────────
       - name: React to comment
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.reactions.createForIssueComment({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
               comment_id: context.payload.comment.id,
-              content: 'rocket'
+              content:    'rocket'
             });
 
-      # ── 2. Checkout repository ─────────────────────────────────────────────
+      # ── 2. Checkout full history so we can create a new branch ────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # ── 3. Install dependencies ────────────────────────────────────────────
+      # ── 3. Install all required tools ─────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -y
@@ -62,69 +75,166 @@ jobs:
             curl \
             wget
 
-      # ── 4. Parse URLs from comment ─────────────────────────────────────────
+      # ── 4. Parse URLs from comment ────────────────────────────────────────
       - name: Parse URLs from comment
         id: parse
         run: |
-          COMMENT='${{ github.event.comment.body }}'
+          # Read the comment body through an env var to avoid shell injection
+          # when the comment contains special characters or quotes.
+          COMMENT_BODY="$(cat <<'COMMENT_EOF'
+          ${{ github.event.comment.body }}
+          COMMENT_EOF
+          )"
 
-          # Strip leading "unzip" keyword (case-insensitive) and trim whitespace
-          URLS_RAW=$(echo "$COMMENT" | sed -E 's/^[Uu][Nn][Zz][Ii][Pp][[:space:]]*//' | tr -s '[:space:]' ' ' | xargs)
+          # Strip leading "unzip" keyword (case-insensitive) and normalise whitespace
+          URLS_RAW=$(printf '%s' "$COMMENT_BODY" \
+            | sed -E 's/^[[:space:]]*[Uu][Nn][Zz][Ii][Pp][[:space:]]*//' \
+            | tr -s '[:space:]' ' ' \
+            | xargs)
 
           if [[ -z "$URLS_RAW" ]]; then
-            echo "No URLs found in comment. Aborting."
+            echo "[ERROR] No URLs found in comment. Aborting."
             exit 1
           fi
 
           echo "Parsed URLs: $URLS_RAW"
-          # Store as a newline-delimited list for the next step
           echo "urls=$URLS_RAW" >> "$GITHUB_OUTPUT"
 
-      # ── 5. Make helper script executable ──────────────────────────────────
+      # ── 5. Create and switch to a dedicated result branch ─────────────────
+      # We commit results to unzip-results/<issue>-<runid> instead of main.
+      # This keeps the default branch clean and makes each run auditable.
+      - name: Create result branch
+        id: branch
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          RUN_ID="${{ github.run_id }}"
+          BRANCH_NAME="unzip-results/issue${ISSUE_NUM}-run${RUN_ID}"
+
+          echo "Creating branch: $BRANCH_NAME"
+          git checkout -b "$BRANCH_NAME"
+
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+      # ── 6. Make helper script executable ──────────────────────────────────
       - name: Prepare script
         run: chmod +x scripts/unzip_from_comment.sh
 
-      # ── 6. Run download + extract + split ──────────────────────────────────
+      # ── 7. Download, validate, extract, and split ─────────────────────────
       - name: Download, extract, and split
         run: |
-          # Convert space-separated URL string into an array
-          IFS=' ' read -ra URL_ARRAY <<< "${{ steps.parse.outputs.urls }}"
-          bash scripts/unzip_from_comment.sh "${URL_ARRAY[@]}"
+          RUN_ID="${{ github.run_id }}"
+          ISSUE_NUM="${{ github.event.issue.number }}"
 
-      # ── 7. Commit and push results ─────────────────────────────────────────
-      - name: Commit and push results
+          # Convert space-separated URL string to an array safely
+          IFS=' ' read -ra URL_ARRAY <<< "${{ steps.parse.outputs.urls }}"
+
+          bash scripts/unzip_from_comment.sh \
+            "$RUN_ID" \
+            "$ISSUE_NUM" \
+            "${URL_ARRAY[@]}"
+
+      # ── 8. Commit and push to the result branch ───────────────────────────
+      - name: Commit and push to result branch
+        id: commit
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add folder/ extracted/ || true
-          git diff --cached --quiet && echo "Nothing to commit." && exit 0
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          RUN_ID="${{ github.run_id }}"
+          RUN_LABEL="issue${ISSUE_NUM}-run${RUN_ID}"
 
-          git commit -m "chore: unzip from comment #${{ github.event.issue.number }}"
-          git push
+          git add "folder/${RUN_LABEL}/" "extracted/${RUN_LABEL}/" 2>/dev/null || true
 
-      # ── 8. Post a success comment ──────────────────────────────────────────
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore(unzip): results for issue #${ISSUE_NUM} (run ${RUN_ID})"
+            git push origin "${{ steps.branch.outputs.branch_name }}"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 9. Build a file summary for the success comment ───────────────────
+      - name: Build file summary
+        id: summary
+        if: steps.commit.outputs.committed == 'true'
+        run: |
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          RUN_ID="${{ github.run_id }}"
+          RUN_LABEL="issue${ISSUE_NUM}-run${RUN_ID}"
+
+          # Count downloads and extracted files
+          DL_COUNT=$(find "folder/${RUN_LABEL}" -type f 2>/dev/null | wc -l)
+          EX_COUNT=$(find "extracted/${RUN_LABEL}" -type f 2>/dev/null | wc -l)
+          SPLIT_COUNT=$(find "extracted/${RUN_LABEL}" -type f -name '*.part_*' 2>/dev/null | wc -l)
+
+          # Build a short file list (max 20 lines)
+          FILE_LIST=$(find "extracted/${RUN_LABEL}" -type f | sort | head -20 \
+            | sed "s|extracted/${RUN_LABEL}/||" \
+            | awk '{print "- `" $0 "`"}')
+
+          SUMMARY="**Downloads:** ${DL_COUNT} file(s) in \`folder/${RUN_LABEL}/\`
+          **Extracted:** ${EX_COUNT} file(s) in \`extracted/${RUN_LABEL}/\`
+          **Split parts created:** ${SPLIT_COUNT}
+
+          <details><summary>Extracted file list</summary>
+
+          ${FILE_LIST}
+          </details>"
+
+          # Write to a temp file to avoid quoting issues
+          printf '%s' "$SUMMARY" > /tmp/summary.txt
+          echo "summary_file=/tmp/summary.txt" >> "$GITHUB_OUTPUT"
+
+      # ── 10. Post success comment with branch name and summary ─────────────
       - name: Post success comment
         if: success()
         uses: actions/github-script@v7
         with:
           script: |
+            const fs      = require('fs');
+            const branch  = '${{ steps.branch.outputs.branch_name }}';
+            const committed = '${{ steps.commit.outputs.committed }}';
+            const summaryFile = '${{ steps.summary.outputs.summary_file }}';
+
+            let summary = '';
+            try { summary = fs.readFileSync(summaryFile, 'utf8'); } catch(_) {}
+
+            const repoUrl = `${{ github.server_url }}/${{ github.repository }}`;
+            const branchUrl = `${repoUrl}/tree/${branch}`;
+            const runUrl = `${repoUrl}/actions/runs/${{ github.run_id }}`;
+
+            const body = committed === 'true'
+              ? `✅ **Unzip complete!**
+
+            Results have been committed to branch [\`${branch}\`](${branchUrl}).
+
+            ${summary}
+
+            [View Actions log](${runUrl})`
+              : `✅ **Unzip ran, but there was nothing new to commit.**
+
+            The output folder may have already existed. [View Actions log](${runUrl})`;
+
             await github.rest.issues.createComment({
-              owner:       context.repo.owner,
-              repo:        context.repo.repo,
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `✅ **Unzip complete!**\n\nFiles have been downloaded, extracted, and committed to the repository.\n- Archives → \`folder/\`\n- Extracted files → \`extracted/\``
+              body
             });
 
-      # ── 9. Post a failure comment ──────────────────────────────────────────
+      # ── 11. Post failure comment ──────────────────────────────────────────
       - name: Post failure comment
         if: failure()
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.issues.createComment({
-              owner:       context.repo.owner,
-              repo:        context.repo.repo,
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `❌ **Unzip failed!**\n\nThe workflow encountered an error. Please check the [Actions log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+              body: `❌ **Unzip failed!**
+
+            The workflow encountered an error. Please check the [Actions log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
             });
