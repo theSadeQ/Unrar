@@ -1,0 +1,130 @@
+# =============================================================================
+# unzip-from-comment.yml
+#
+# Triggered by an issue or PR comment that starts with "unzip".
+# Downloads the listed archive URLs, extracts them, splits files > 90 MB,
+# and commits everything back to the repository.
+#
+# Comment format:
+#   unzip https://example.com/archive.zip
+#   unzip https://example.com/movie.part1.rar https://example.com/movie.part2.rar
+# =============================================================================
+
+name: Unzip from Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  unzip:
+    # Only run when the comment body starts with "unzip" (case-insensitive)
+    if: |
+      startsWith(github.event.comment.body, 'unzip') ||
+      startsWith(github.event.comment.body, 'Unzip') ||
+      startsWith(github.event.comment.body, 'UNZIP')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # allow pushing commits
+      issues: write            # allow posting reaction / status comments
+      pull-requests: write
+
+    steps:
+      # ── 1. React to comment so the user sees the workflow started ──────────
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      # ── 2. Checkout repository ─────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ── 3. Install dependencies ────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            aria2 \
+            unrar \
+            p7zip-full \
+            unzip \
+            tar \
+            curl \
+            wget
+
+      # ── 4. Parse URLs from comment ─────────────────────────────────────────
+      - name: Parse URLs from comment
+        id: parse
+        run: |
+          COMMENT='${{ github.event.comment.body }}'
+
+          # Strip leading "unzip" keyword (case-insensitive) and trim whitespace
+          URLS_RAW=$(echo "$COMMENT" | sed -E 's/^[Uu][Nn][Zz][Ii][Pp][[:space:]]*//' | tr -s '[:space:]' ' ' | xargs)
+
+          if [[ -z "$URLS_RAW" ]]; then
+            echo "No URLs found in comment. Aborting."
+            exit 1
+          fi
+
+          echo "Parsed URLs: $URLS_RAW"
+          # Store as a newline-delimited list for the next step
+          echo "urls=$URLS_RAW" >> "$GITHUB_OUTPUT"
+
+      # ── 5. Make helper script executable ──────────────────────────────────
+      - name: Prepare script
+        run: chmod +x scripts/unzip_from_comment.sh
+
+      # ── 6. Run download + extract + split ──────────────────────────────────
+      - name: Download, extract, and split
+        run: |
+          # Convert space-separated URL string into an array
+          IFS=' ' read -ra URL_ARRAY <<< "${{ steps.parse.outputs.urls }}"
+          bash scripts/unzip_from_comment.sh "${URL_ARRAY[@]}"
+
+      # ── 7. Commit and push results ─────────────────────────────────────────
+      - name: Commit and push results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add folder/ extracted/ || true
+          git diff --cached --quiet && echo "Nothing to commit." && exit 0
+
+          git commit -m "chore: unzip from comment #${{ github.event.issue.number }}"
+          git push
+
+      # ── 8. Post a success comment ──────────────────────────────────────────
+      - name: Post success comment
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `✅ **Unzip complete!**\n\nFiles have been downloaded, extracted, and committed to the repository.\n- Archives → \`folder/\`\n- Extracted files → \`extracted/\``
+            });
+
+      # ── 9. Post a failure comment ──────────────────────────────────────────
+      - name: Post failure comment
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `❌ **Unzip failed!**\n\nThe workflow encountered an error. Please check the [Actions log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            });
